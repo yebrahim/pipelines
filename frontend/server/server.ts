@@ -14,20 +14,44 @@
 
 import * as Storage from '@google-cloud/storage';
 import * as express from 'express';
-import { Application, static as StaticHandler } from 'express';
 import * as fs from 'fs';
-import * as proxy from 'http-proxy-middleware';
-import { Client as MinioClient } from 'minio';
-import fetch from 'node-fetch';
+import * as k8sHelper from './k8s-helper';
 import * as path from 'path';
 import * as process from 'process';
-// @ts-ignore
+import * as proxy from 'http-proxy-middleware';
 import * as tar from 'tar';
-import * as k8sHelper from './k8s-helper';
+import RunUtils from '../src/lib/RunUtils';
+import fetch from 'node-fetch';
 import proxyMiddleware from './proxy-middleware';
+import { ApiRun, ApiRunDetail } from '../src/apis/run';
+import { Apis } from '../src/lib/Apis';
+import { Application, static as StaticHandler } from 'express';
+import { Client as MinioClient } from 'minio';
 import { Stream } from 'stream';
+import { Workflow } from '../third_party/argo-ui/argo_template';
+import { errorToMessage } from '../src/lib/Utils';
 
 const BASEPATH = '/pipeline';
+
+interface ExperimentInfo {
+  displayName?: string;
+  id: string;
+}
+
+interface PipelineInfo {
+  displayName?: string;
+  id?: string;
+  runId?: string;
+  showLink: boolean;
+}
+
+interface DisplayRun {
+  experiment?: ExperimentInfo;
+  metadata: ApiRun;
+  pipeline?: PipelineInfo;
+  workflow?: Workflow;
+  error?: string;
+}
 
 // The minio endpoint, port, access and secret keys are hardcoded to the same
 // values used in the deployment.
@@ -70,6 +94,7 @@ const apiServerPort = process.env.ML_PIPELINE_SERVICE_PORT || '3001';
 const apiServerAddress = `http://${apiServerHost}:${apiServerPort}`;
 
 const v1beta1Prefix = 'apis/v1beta1';
+const middlewarePrefix = 'middleware/v1beta1';
 
 const healthzStats = {
   apiServerCommitHash: '',
@@ -234,6 +259,102 @@ const logsHandler = async (req, res) => {
   }
 };
 
+function _getAndSetMetadataAndWorkflows(displayRuns: DisplayRun[]): Promise<DisplayRun[]> {
+  // Fetch and set the workflow details
+  return Promise.all(displayRuns.map(async displayRun => {
+    let getRunResponse: ApiRunDetail;
+    try {
+      getRunResponse = await Apis.runServiceApi.getRun(displayRun.metadata!.id!);
+      displayRun.metadata = getRunResponse.run!;
+      displayRun.workflow =
+        JSON.parse(getRunResponse.pipeline_runtime!.workflow_manifest || '{}');
+    } catch (err) {
+      // This could be an API exception, or a JSON parse exception.
+      displayRun.error = await errorToMessage(err);
+    }
+    return displayRun;
+  }));
+}
+
+/**
+ * For each DisplayRun, get its ApiRun and retrieve that ApiRun's Pipeline ID if it has one, then
+ * use that Pipeline ID to fetch its associated Pipeline and attach that Pipeline's name to the
+ * DisplayRun. If the ApiRun has no Pipeline ID, then the corresponding DisplayRun will show '-'.
+ */
+function _getAndSetPipelineNames(displayRuns: DisplayRun[]): Promise<DisplayRun[]> {
+  return Promise.all(
+    displayRuns.map(async (displayRun) => {
+      const pipelineId = RunUtils.getPipelineId(displayRun.metadata);
+      if (pipelineId) {
+        try {
+          const pipeline = await Apis.pipelineServiceApi.getPipeline(pipelineId);
+          displayRun.pipeline = { displayName: pipeline.name || '', id: pipelineId, showLink: false };
+        } catch (err) {
+          // This could be an API exception, or a JSON parse exception.
+          displayRun.error = 'Failed to get associated pipeline: ' + await errorToMessage(err);
+        }
+      } else if (!!RunUtils.getPipelineSpec(displayRun.metadata)) {
+        displayRun.pipeline = { showLink: true };
+      }
+      return displayRun;
+    })
+  );
+}
+
+/**
+ * For each DisplayRun, get its ApiRun and retrieve that ApiRun's Experiment ID if it has one,
+ * then use that Experiment ID to fetch its associated Experiment and attach that Experiment's
+ * name to the DisplayRun. If the ApiRun has no Experiment ID, then the corresponding DisplayRun
+ * will show '-'.
+ */
+function _getAndSetExperimentNames(displayRuns: DisplayRun[]): Promise<DisplayRun[]> {
+  return Promise.all(
+    displayRuns.map(async (displayRun) => {
+      const experimentId = RunUtils.getFirstExperimentReferenceId(displayRun.metadata);
+      if (experimentId) {
+        try {
+          // TODO: Experiment could be an optional field in state since whenever the RunList is
+          // created from the ExperimentDetails page, we already have the experiment (and will)
+          // be fetching the same one over and over here.
+          const experiment = await Apis.experimentServiceApi.getExperiment(experimentId);
+          displayRun.experiment = { displayName: experiment.name || '', id: experimentId };
+        } catch (err) {
+          // This could be an API exception, or a JSON parse exception.
+          displayRun.error = 'Failed to get associated experiment: ' + await errorToMessage(err);
+        }
+      }
+      return displayRun;
+    })
+  );
+}
+
+const runsWithDetailsHandler = async (req, res) => {
+  const pageToken = req.query.pageToken;
+  const pageSize = req.query.pageSize;
+  const sortBy = req.query.sortBy;
+  const resourceReferenceKeyType = req.query.resourceReferenceKeyType;
+  const resourceReferenceKeyId = req.query.resourceReferenceKeyId;
+  const filter = req.query.filter;
+
+  const response = await Apis.runServiceApi.listRuns(
+    pageToken,
+    pageSize,
+    sortBy,
+    resourceReferenceKeyType,
+    resourceReferenceKeyId,
+    filter,
+  );
+
+  const displayRuns: DisplayRun[] = (response.runs || []).map(r => ({ metadata: r }));
+  const nextPageToken = response.next_page_token || '';
+
+  await _getAndSetMetadataAndWorkflows(displayRuns);
+  await _getAndSetPipelineNames(displayRuns);
+  await _getAndSetExperimentNames(displayRuns);
+
+  res.json({ displayRuns, nextPageToken });
+};
+
 app.get('/' + v1beta1Prefix + '/healthz', healthzHandler);
 app.get(BASEPATH + '/' + v1beta1Prefix + '/healthz', healthzHandler);
 
@@ -254,6 +375,9 @@ app.get(BASEPATH + '/k8s/pod/logs', logsHandler);
 proxyMiddleware(app, BASEPATH + '/' + v1beta1Prefix);
 proxyMiddleware(app, '/' + v1beta1Prefix);
 
+app.get('/' + middlewarePrefix + '/listRunsWithDetails', runsWithDetailsHandler);
+app.get(BASEPATH + '/' + middlewarePrefix + '/listRunsWithDetails', runsWithDetailsHandler);
+
 app.all('/' + v1beta1Prefix + '/*', proxy({
   changeOrigin: true,
   onProxyReq: proxyReq => {
@@ -262,7 +386,7 @@ app.all('/' + v1beta1Prefix + '/*', proxy({
   target: apiServerAddress,
 }));
 
-app.all(BASEPATH  + '/' + v1beta1Prefix + '/*', proxy({
+app.all(BASEPATH + '/' + v1beta1Prefix + '/*', proxy({
   changeOrigin: true,
   onProxyReq: proxyReq => {
     console.log('Proxied request: ', (proxyReq as any).path);
